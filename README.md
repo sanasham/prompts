@@ -1549,3 +1549,63 @@ export const appConfig = {
   },
 };
 ====================================================================================
+-- Staging table (temporary holding area)
+CREATE TABLE dbo.LoanProductsStaging (
+    StagingID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BatchID UNIQUEIDENTIFIER NOT NULL, -- Group this upload
+    RowNumber INT NOT NULL,
+    
+    -- Product data
+    ProductID NVARCHAR(50) NOT NULL,
+    ProductName NVARCHAR(255) NOT NULL,
+    LoanStartDate DATE NOT NULL,
+    WithdrawnDate DATE NULL,
+    Pricing DECIMAL(5,2) NOT NULL,
+    
+    -- Processing metadata
+    ValidationStatus NVARCHAR(20) DEFAULT 'PENDING' CHECK (ValidationStatus IN ('PENDING', 'VALID', 'INVALID', 'PROCESSED')),
+    ValidationErrors NVARCHAR(MAX) NULL,
+    ProcessedDate DATETIME2(3) NULL,
+    
+    -- Audit
+    UploadedDate DATETIME2(3) DEFAULT SYSDATETIME(),
+    UploadedBy NVARCHAR(100) NOT NULL,
+    
+    INDEX IX_Staging_BatchID (BatchID, ValidationStatus)
+);
+
+-- Batch tracking table
+CREATE TABLE dbo.UploadBatches (
+    BatchID UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    FileName NVARCHAR(500) NOT NULL,
+    TotalRecords INT NOT NULL,
+    ValidRecords INT DEFAULT 0,
+    InvalidRecords INT DEFAULT 0,
+    ProcessedRecords INT DEFAULT 0,
+    
+    BatchStatus NVARCHAR(20) DEFAULT 'UPLOADED' CHECK (BatchStatus IN 
+        ('UPLOADED', 'VALIDATING', 'VALIDATED', 'PROCESSING', 'COMPLETED', 'FAILED')),
+    
+    UploadedDate DATETIME2(3) DEFAULT SYSDATETIME(),
+    UploadedBy NVARCHAR(100) NOT NULL,
+    ProcessingStarted DATETIME2(3) NULL,
+    ProcessingCompleted DATETIME2(3) NULL,
+    
+    INDEX IX_Batches_Status (BatchStatus, UploadedDate DESC)
+);
+
+-- Processing log (granular tracking)
+CREATE TABLE dbo.ProcessingLog (
+    LogID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BatchID UNIQUEIDENTIFIER NOT NULL,
+    ChunkNumber INT NOT NULL,
+    RecordsProcessed INT NOT NULL,
+    RecordsCreated INT NOT NULL,
+    RecordsUpdated INT NOT NULL,
+    RecordsSkipped INT NOT NULL,
+    ProcessingTime INT NOT NULL, -- milliseconds
+    LogDate DATETIME2(3) DEFAULT SYSDATETIME(),
+    
+    INDEX IX_Log_BatchID (BatchID, ChunkNumber)
+);
+==========================================
