@@ -774,3 +774,357 @@ export interface ProductWithChanges {
   productName: string;
   changes: ProductChange;
 }
+==============================================
+
+import { Request, Response } from 'express';
+import { ExcelParserService } from '../services/ExcelParserService';
+import { UploadService } from '../services/UploadService';
+import { ValidationService } from '../services/ValidationService';
+import { BatchProcessingService } from '../services/BatchProcessingService';
+import { ApiResponseUtil } from '../utils/ApiResponse';
+import { AppError } from '../utils/AppError';
+import { logger } from '../config/logger.config';
+import { UploadResponse } from '../types/api.types';
+
+/**
+ * UploadController
+ * Handles file upload operations for monthly loan product Excel files
+ */
+export class UploadController {
+  private excelParserService: ExcelParserService;
+  private uploadService: UploadService;
+  private validationService: ValidationService;
+  private batchProcessingService: BatchProcessingService;
+
+  constructor() {
+    this.excelParserService = new ExcelParserService();
+    this.uploadService = new UploadService();
+    this.validationService = new ValidationService();
+    this.batchProcessingService = new BatchProcessingService();
+  }
+
+  /**
+   * Handle monthly Excel file upload
+   * 
+   * Process:
+   * 1. Validate file exists
+   * 2. Parse Excel file
+   * 3. Insert to staging table
+   * 4. Return immediate response with batchId
+   * 5. Trigger background validation and processing
+   * 
+   * @param req - Express Request object with uploaded file
+   * @param res - Express Response object
+   * @returns Promise<Response> - API response with batch details
+   */
+  public async uploadFile(req: Request, res: Response): Promise<Response> {
+    const startTime = Date.now();
+
+    // Step 1: Validate file exists
+    if (!req.file) {
+      logger.warn('Upload attempt without file');
+      throw new AppError('No file uploaded', 400);
+    }
+
+    // Step 2: Extract user information and file details
+    const username = (req as any).user?.username || 'system';
+    const fileName = req.file.originalname;
+    const fileSize = req.file.size;
+
+    logger.info(`Upload initiated`, {
+      username,
+      fileName,
+      fileSize,
+      timestamp: new Date().toISOString(),
+    });
+
+    try {
+      // Step 3: Parse Excel file
+      logger.info(`Parsing Excel file: ${fileName}`);
+      const products = this.excelParserService.parseExcelFile(req.file.buffer);
+      
+      logger.info(`Successfully parsed ${products.length} products from Excel`, {
+        fileName,
+        productCount: products.length,
+      });
+
+      // Step 4: Validate minimum requirements
+      if (products.length === 0) {
+        throw new AppError('Excel file contains no valid product records', 400);
+      }
+
+      // Step 5: Insert to staging table
+      logger.info(`Inserting ${products.length} products to staging table`);
+      const batchId = await this.uploadService.insertToStaging(
+        products,
+        fileName,
+        username
+      );
+
+      logger.info(`Successfully created batch`, {
+        batchId,
+        productCount: products.length,
+        username,
+      });
+
+      // Step 6: Trigger background validation and processing
+      // Note: This is fire-and-forget, we don't wait for completion
+      this.validateAndProcess(batchId, username);
+
+      // Step 7: Prepare response
+      const processingTime = Date.now() - startTime;
+      
+      const response: UploadResponse = {
+        batchId,
+        totalRecords: products.length,
+        status: 'VALIDATING',
+        message: 'Upload received successfully. Validation in progress...',
+        statusUrl: `/api/v1/batches/${batchId}/status`,
+      };
+
+      logger.info(`Upload completed successfully`, {
+        batchId,
+        processingTime: `${processingTime}ms`,
+        totalRecords: products.length,
+      });
+
+      // Step 8: Return immediate success response
+      return ApiResponseUtil.success(
+        res,
+        response,
+        'File uploaded successfully. Processing initiated.'
+      );
+
+    } catch (error) {
+      const processingTime = Date.now() - startTime;
+      
+      logger.error(`Upload failed`, {
+        username,
+        fileName,
+        error: (error as Error).message,
+        processingTime: `${processingTime}ms`,
+      });
+
+      // Re-throw to be handled by error middleware
+      throw error;
+    }
+  }
+
+  /**
+   * Validate and process batch in background
+   * This method runs asynchronously without blocking the upload response
+   * 
+   * Process:
+   * 1. Validate all records in staging
+   * 2. Update batch status to VALIDATED
+   * 3. Start chunk-based processing
+   * 
+   * @param batchId - UUID of the batch to process
+   * @param username - Username who initiated the upload
+   */
+  private async validateAndProcess(batchId: string, username: string): Promise<void> {
+    try {
+      logger.info(`Starting background validation for batch ${batchId}`);
+
+      // Step 1: Validate batch
+      await this.validationService.validateBatch(batchId);
+      
+      logger.info(`Validation completed for batch ${batchId}`);
+
+      // Step 2: Get validation results
+      const batch = await this.uploadService.getBatchById(batchId);
+      
+      logger.info(`Batch validation summary`, {
+        batchId,
+        validRecords: batch.ValidRecords,
+        invalidRecords: batch.InvalidRecords,
+        totalRecords: batch.TotalRecords,
+      });
+
+      // Step 3: Check if there are valid records to process
+      if (batch.ValidRecords === 0) {
+        logger.warn(`No valid records to process for batch ${batchId}`);
+        return;
+      }
+
+      // Step 4: Start batch processing (fire and forget)
+      logger.info(`Starting background processing for batch ${batchId}`);
+      await this.batchProcessingService.processBatchAsync(batchId, username);
+
+    } catch (error) {
+      logger.error(`Background validation/processing failed for batch ${batchId}`, {
+        error: (error as Error).message,
+        stack: (error as Error).stack,
+      });
+
+      // Update batch status to FAILED
+      try {
+        const pool = await (await import('../config/database')).database.getPool();
+        const sql = (await import('../config/database')).sql;
+        
+        await pool.request()
+          .input('BatchID', sql.UniqueIdentifier, batchId)
+          .query(`
+            UPDATE UploadBatches
+            SET BatchStatus = 'FAILED'
+            WHERE BatchID = @BatchID
+          `);
+      } catch (updateError) {
+        logger.error(`Failed to update batch status to FAILED`, {
+          batchId,
+          error: (updateError as Error).message,
+        });
+      }
+    }
+  }
+
+  /**
+   * Get upload statistics (optional utility method)
+   * Can be used to show upload history or analytics
+   * 
+   * @param req - Express Request object
+   * @param res - Express Response object
+   */
+  public async getUploadStats(req: Request, res: Response): Promise<Response> {
+    try {
+      const username = (req as any).user?.username;
+      const pool = await (await import('../config/database')).database.getPool();
+      const sql = (await import('../config/database')).sql;
+
+      const result = await pool.request()
+        .input('Username', sql.NVarChar(100), username)
+        .query(`
+          SELECT 
+            COUNT(*) as TotalUploads,
+            SUM(TotalRecords) as TotalRecordsProcessed,
+            SUM(ValidRecords) as TotalValidRecords,
+            SUM(InvalidRecords) as TotalInvalidRecords,
+            SUM(CASE WHEN BatchStatus = 'COMPLETED' THEN 1 ELSE 0 END) as CompletedBatches,
+            SUM(CASE WHEN BatchStatus = 'FAILED' THEN 1 ELSE 0 END) as FailedBatches,
+            MIN(UploadedDate) as FirstUpload,
+            MAX(UploadedDate) as LastUpload
+          FROM UploadBatches
+          WHERE UploadedBy = @Username
+        `);
+
+      const stats = result.recordset[0];
+
+      return ApiResponseUtil.success(res, stats, 'Upload statistics retrieved');
+    } catch (error) {
+      logger.error('Failed to get upload stats:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Retry failed batch (optional utility method)
+   * Allows retrying a failed batch without re-uploading the file
+   * 
+   * @param req - Express Request object with batchId param
+   * @param res - Express Response object
+   */
+  public async retryBatch(req: Request, res: Response): Promise<Response> {
+    const { batchId } = req.params;
+    const username = (req as any).user?.username || 'system';
+
+    try {
+      logger.info(`Retry requested for batch ${batchId} by ${username}`);
+
+      // Get batch details
+      const batch = await this.uploadService.getBatchById(batchId);
+
+      // Check if batch is in a retryable state
+      if (batch.BatchStatus !== 'FAILED') {
+        throw new AppError(
+          `Batch cannot be retried. Current status: ${batch.BatchStatus}`,
+          400
+        );
+      }
+
+      // Reset batch status
+      const pool = await (await import('../config/database')).database.getPool();
+      const sql = (await import('../config/database')).sql;
+
+      await pool.request()
+        .input('BatchID', sql.UniqueIdentifier, batchId)
+        .query(`
+          UPDATE UploadBatches
+          SET 
+            BatchStatus = 'VALIDATED',
+            ProcessedRecords = 0,
+            ProcessingStarted = NULL,
+            ProcessingCompleted = NULL
+          WHERE BatchID = @BatchID;
+
+          UPDATE LoanProductsStaging
+          SET 
+            ValidationStatus = 'VALID',
+            ProcessedDate = NULL
+          WHERE BatchID = @BatchID AND ValidationStatus = 'PROCESSED';
+        `);
+
+      // Start processing again
+      await this.batchProcessingService.processBatchAsync(batchId, username);
+
+      logger.info(`Batch retry initiated successfully for ${batchId}`);
+
+      return ApiResponseUtil.success(
+        res,
+        { batchId, status: 'PROCESSING' },
+        'Batch retry initiated successfully'
+      );
+    } catch (error) {
+      logger.error(`Failed to retry batch ${batchId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel ongoing batch processing (optional utility method)
+   * Note: This only updates the status. Actual chunk processing 
+   * that's already running will complete.
+   * 
+   * @param req - Express Request object with batchId param
+   * @param res - Express Response object
+   */
+  public async cancelBatch(req: Request, res: Response): Promise<Response> {
+    const { batchId } = req.params;
+    const username = (req as any).user?.username || 'system';
+
+    try {
+      logger.info(`Cancel requested for batch ${batchId} by ${username}`);
+
+      const batch = await this.uploadService.getBatchById(batchId);
+
+      // Check if batch can be cancelled
+      if (!['VALIDATING', 'VALIDATED', 'PROCESSING'].includes(batch.BatchStatus)) {
+        throw new AppError(
+          `Batch cannot be cancelled. Current status: ${batch.BatchStatus}`,
+          400
+        );
+      }
+
+      const pool = await (await import('../config/database')).database.getPool();
+      const sql = (await import('../config/database')).sql;
+
+      await pool.request()
+        .input('BatchID', sql.UniqueIdentifier, batchId)
+        .query(`
+          UPDATE UploadBatches
+          SET BatchStatus = 'FAILED'
+          WHERE BatchID = @BatchID
+        `);
+
+      logger.info(`Batch cancelled successfully: ${batchId}`);
+
+      return ApiResponseUtil.success(
+        res,
+        { batchId, status: 'FAILED' },
+        'Batch cancelled successfully'
+      );
+    } catch (error) {
+      logger.error(`Failed to cancel batch ${batchId}:`, error);
+      throw error;
+    }
+  }
+}
